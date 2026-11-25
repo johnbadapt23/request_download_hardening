@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Request & Download Hardening
  * Description: Four narrow, self-contained security fixes that work on any WordPress site with no configuration: (1) closes unauthenticated access to Download Monitor (dlm_download) files via both the REST API and the direct /download/ link, (2) strips HTML/script markup out of incoming GET parameters before any theme or plugin code can read them, closing reflected-XSS holes in custom search/filter templates, (3) hardens XML-RPC by removing the pingback methods used for SSRF/DDoS amplification, hiding the endpoint's discovery header/link, and rate-limiting failed login attempts (covers both wp-login.php and XML-RPC, since both share WordPress's own authentication pipeline), and (4) blocks the two standard ways a site leaks its real usernames to a logged-out visitor (?author=N probing and the public REST users list) and genericizes the login form's error message so it stops confirming whether a guessed username exists. Every module no-ops safely if its target isn't present, and none of them touch POST, AJAX, cron, wp-admin, or any already-authenticated visitor - normal site functionality, layout, and content editing are completely unaffected.
- * Version: 1.3.1
+ * Version: 1.3.2
  * Author: ADAPT
  * License: GPL-2.0-or-later
  * Update URI: https://github.com/johnbadapt23/request_download_hardening
@@ -554,7 +554,8 @@ if ( ! defined( 'RDH_DISABLE_USERNAME_PROTECTION' ) || ! RDH_DISABLE_USERNAME_PR
  *   a) update_plugins_github.com (WordPress 5.8+). Core calls this filter
  *      during its normal update check for any plugin whose "Update URI"
  *      header points at github.com. The callback asks the GitHub API for
- *      the repository's latest published release and reports its tag
+ *      the repository's latest published release (or, if none is
+ *      published yet, its highest version tag) and reports its tag
  *      (with any leading "v" removed) as the available version. Core then
  *      compares that against the installed Version header and shows the
  *      usual "update available" notice, the "Update now" link, and the
@@ -606,16 +607,15 @@ function rdh_github_latest_release() {
 		return empty( $cached['version'] ) ? null : $cached;
 	}
 
-	$response = wp_remote_get(
-		'https://api.github.com/repos/' . RDH_GITHUB_REPO . '/releases/latest',
-		[
-			'timeout' => 10,
-			'headers' => [ 'Accept' => 'application/vnd.github+json' ],
-		]
-	);
-
+	$api     = 'https://api.github.com/repos/' . RDH_GITHUB_REPO;
 	$release = null;
-	if ( ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response ) ) {
+	$error   = '';
+
+	// 1. The latest published release (preferred: carries release notes).
+	$response = rdh_github_get( $api . '/releases/latest' );
+	$code     = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
+
+	if ( 200 === $code ) {
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
 		if ( is_array( $body ) && ! empty( $body['tag_name'] ) && ! empty( $body['zipball_url'] ) ) {
 			$release = [
@@ -627,13 +627,101 @@ function rdh_github_latest_release() {
 				'published' => (string) ( $body['published_at'] ?? '' ),
 			];
 		}
+	} elseif ( 404 === $code ) {
+		// 2. No published release yet: fall back to the highest version
+		//    tag, so pushing a tag such as v1.4.0 is enough on its own.
+		//    (A 404 here also means a private repository without a valid
+		//    RDH_GITHUB_TOKEN, which the tags request below reports too.)
+		$response = rdh_github_get( $api . '/tags?per_page=100' );
+		$code     = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 === $code ) {
+			$tags = json_decode( wp_remote_retrieve_body( $response ), true );
+			foreach ( (array) $tags as $tag ) {
+				$name    = (string) ( $tag['name'] ?? '' );
+				$version = ltrim( $name, 'vV' );
+				if ( ! preg_match( '/^\d+(\.\d+)*$/', $version ) || empty( $tag['zipball_url'] ) ) {
+					continue; // Ignore non-version tags and pre-release suffixes.
+				}
+				if ( ! $release || version_compare( $version, $release['version'], '>' ) ) {
+					$release = [
+						'version'   => $version,
+						'tag'       => $name,
+						'package'   => (string) $tag['zipball_url'],
+						'url'       => 'https://github.com/' . RDH_GITHUB_REPO . '/tree/' . rawurlencode( $name ),
+						'notes'     => '',
+						'published' => '',
+					];
+				}
+			}
+			if ( ! $release ) {
+				$error = 'no_release';
+			}
+		}
 	}
 
-	// An empty array is cached on failure so a GitHub outage, a missing
-	// release, or a missing token is retried hourly, not on every request.
-	set_site_transient( $cache_key, $release ?: [], $release ? 6 * HOUR_IN_SECONDS : HOUR_IN_SECONDS );
+	if ( ! $release && ! $error ) {
+		if ( is_wp_error( $response ) ) {
+			$error = 'connection: ' . $response->get_error_message();
+		} elseif ( 403 === $code || 429 === $code ) {
+			$error = 'rate_limited';
+		} elseif ( 404 === $code ) {
+			$error = 'not_found';
+		} else {
+			$error = 'http_' . $code;
+		}
+	}
+
+	// Failures are cached for an hour (with the reason, for the "Check for
+	// updates" notice) so an outage is not retried on every request.
+	set_site_transient( $cache_key, $release ?: [ 'error' => $error ], $release ? 6 * HOUR_IN_SECONDS : HOUR_IN_SECONDS );
 
 	return $release;
+}
+
+/**
+ * GET request to the GitHub API with the headers GitHub expects.
+ *
+ * @param string $url Full api.github.com URL.
+ * @return array|WP_Error
+ */
+function rdh_github_get( $url ) {
+	return wp_remote_get(
+		$url,
+		[
+			'timeout'    => 10,
+			'user-agent' => 'request-download-hardening-updater',
+			'headers'    => [
+				'Accept'               => 'application/vnd.github+json',
+				'X-GitHub-Api-Version' => '2022-11-28',
+			],
+		]
+	);
+}
+
+/**
+ * Explains why the last GitHub check found no version, for the admin notice.
+ *
+ * @return string
+ */
+function rdh_github_error_message() {
+	$cached = get_site_transient( 'rdh_github_release' );
+	$error  = is_array( $cached ) ? (string) ( $cached['error'] ?? '' ) : '';
+
+	if ( 'no_release' === $error ) {
+		return __( 'no release or version tag (for example v1.4.0) was found on GitHub yet.' );
+	}
+	if ( 'rate_limited' === $error ) {
+		return __( 'GitHub refused the request because of its rate limit. Please try again in an hour.' );
+	}
+	if ( 'not_found' === $error ) {
+		return __( 'the GitHub repository was not found. If it is private, define RDH_GITHUB_TOKEN in wp-config.php.' );
+	}
+	if ( 0 === strpos( $error, 'connection: ' ) ) {
+		/* translators: %s: technical error message. */
+		return sprintf( __( 'this server could not connect to GitHub (%s). The host may be blocking outbound requests.' ), substr( $error, 12 ) );
+	}
+	/* translators: %s: error code. */
+	return sprintf( __( 'GitHub returned an unexpected response (%s).' ), $error ?: 'unknown' );
 }
 
 add_filter(
@@ -823,8 +911,8 @@ $rdh_update_notice = function () {
 		$message = sprintf( __( '%s is up to date.' ), $name );
 	} else {
 		$type    = 'error';
-		/* translators: %s: plugin name. */
-		$message = sprintf( __( '%s: could not reach GitHub to check for updates. Please try again shortly.' ), $name );
+		/* translators: 1: plugin name, 2: reason. */
+		$message = sprintf( __( '%1$s: could not check for updates, because %2$s' ), $name, rdh_github_error_message() );
 	}
 
 	printf( '<div class="notice notice-%1$s is-dismissible"><p>%2$s</p></div>', esc_attr( $type ), esc_html( $message ) );
