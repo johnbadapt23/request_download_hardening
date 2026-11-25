@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Request & Download Hardening
  * Description: Four narrow, self-contained security fixes that work on any WordPress site with no configuration: (1) closes unauthenticated access to Download Monitor (dlm_download) files via both the REST API and the direct /download/ link, (2) strips HTML/script markup out of incoming GET parameters before any theme or plugin code can read them, closing reflected-XSS holes in custom search/filter templates, (3) hardens XML-RPC by removing the pingback methods used for SSRF/DDoS amplification, hiding the endpoint's discovery header/link, and rate-limiting failed login attempts (covers both wp-login.php and XML-RPC, since both share WordPress's own authentication pipeline), and (4) blocks the two standard ways a site leaks its real usernames to a logged-out visitor (?author=N probing and the public REST users list) and genericizes the login form's error message so it stops confirming whether a guessed username exists. Every module no-ops safely if its target isn't present, and none of them touch POST, AJAX, cron, wp-admin, or any already-authenticated visitor - normal site functionality, layout, and content editing are completely unaffected.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: ADAPT
  * License: GPL-2.0-or-later
  * Update URI: https://github.com/johnbadapt23/request_download_hardening
@@ -751,3 +751,83 @@ add_action(
 	10,
 	2
 );
+
+// "Check for updates" link under the plugin's name on the Plugins screen.
+// Clears the cached GitHub response and WordPress's own update data, runs a
+// fresh check straight away, then returns to the Plugins screen with a
+// notice saying whether a newer version is available.
+add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), 'rdh_check_updates_link' );
+add_filter( 'network_admin_plugin_action_links_' . plugin_basename( __FILE__ ), 'rdh_check_updates_link' );
+
+/**
+ * Adds the "Check for updates" link to this plugin's row.
+ *
+ * @param array $links Existing action links.
+ * @return array
+ */
+function rdh_check_updates_link( $links ) {
+	if ( current_user_can( 'update_plugins' ) ) {
+		$url     = wp_nonce_url( add_query_arg( 'rdh_check_updates', '1', self_admin_url( 'plugins.php' ) ), 'rdh_check_updates' );
+		$links[] = '<a href="' . esc_url( $url ) . '">' . esc_html__( 'Check for updates' ) . '</a>';
+	}
+	return $links;
+}
+
+add_action(
+	'admin_init',
+	function () {
+		if ( empty( $_GET['rdh_check_updates'] ) ) {
+			return;
+		}
+		check_admin_referer( 'rdh_check_updates' );
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			wp_die( esc_html__( 'Sorry, you are not allowed to update plugins for this site.' ) );
+		}
+
+		delete_site_transient( 'rdh_github_release' );
+		delete_site_transient( 'update_plugins' );
+		wp_update_plugins();
+
+		$updates = get_site_transient( 'update_plugins' );
+		$basename = plugin_basename( __FILE__ );
+		if ( isset( $updates->response[ $basename ] ) ) {
+			$result = 'available';
+		} elseif ( isset( $updates->no_update[ $basename ] ) ) {
+			$result = 'current';
+		} else {
+			$result = 'failed';
+		}
+
+		wp_safe_redirect( add_query_arg( 'rdh_checked', $result, self_admin_url( 'plugins.php' ) ) );
+		exit;
+	}
+);
+
+$rdh_update_notice = function () {
+	if ( empty( $_GET['rdh_checked'] ) || ! current_user_can( 'update_plugins' ) ) {
+		return;
+	}
+
+	$result   = sanitize_key( wp_unslash( $_GET['rdh_checked'] ) );
+	$basename = plugin_basename( __FILE__ );
+	$updates  = get_site_transient( 'update_plugins' );
+	$name     = get_file_data( __FILE__, [ 'Name' => 'Plugin Name' ] )['Name'];
+
+	if ( 'available' === $result && isset( $updates->response[ $basename ] ) ) {
+		$type    = 'warning';
+		/* translators: 1: plugin name, 2: version number. */
+		$message = sprintf( __( '%1$s: version %2$s is available. Use the update link in the plugin\'s row to install it.' ), $name, $updates->response[ $basename ]->new_version );
+	} elseif ( 'current' === $result ) {
+		$type    = 'success';
+		/* translators: %s: plugin name. */
+		$message = sprintf( __( '%s is up to date.' ), $name );
+	} else {
+		$type    = 'error';
+		/* translators: %s: plugin name. */
+		$message = sprintf( __( '%s: could not reach GitHub to check for updates. Please try again shortly.' ), $name );
+	}
+
+	printf( '<div class="notice notice-%1$s is-dismissible"><p>%2$s</p></div>', esc_attr( $type ), esc_html( $message ) );
+};
+add_action( 'admin_notices', $rdh_update_notice );
+add_action( 'network_admin_notices', $rdh_update_notice );
