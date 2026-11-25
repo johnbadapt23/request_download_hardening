@@ -2,9 +2,10 @@
 /**
  * Plugin Name: Request & Download Hardening
  * Description: Four narrow, self-contained security fixes that work on any WordPress site with no configuration: (1) closes unauthenticated access to Download Monitor (dlm_download) files via both the REST API and the direct /download/ link, (2) strips HTML/script markup out of incoming GET parameters before any theme or plugin code can read them, closing reflected-XSS holes in custom search/filter templates, (3) hardens XML-RPC by removing the pingback methods used for SSRF/DDoS amplification, hiding the endpoint's discovery header/link, and rate-limiting failed login attempts (covers both wp-login.php and XML-RPC, since both share WordPress's own authentication pipeline), and (4) blocks the two standard ways a site leaks its real usernames to a logged-out visitor (?author=N probing and the public REST users list) and genericizes the login form's error message so it stops confirming whether a guessed username exists. Every module no-ops safely if its target isn't present, and none of them touch POST, AJAX, cron, wp-admin, or any already-authenticated visitor - normal site functionality, layout, and content editing are completely unaffected.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: ADAPT
  * License: GPL-2.0-or-later
+ * Update URI: https://github.com/johnbadapt23/request_download_hardening
  *
  * HOW TO DISABLE A MODULE ON A SITE WHERE ITS DEFAULT WOULD BE WRONG
  * -------------------------------------------------------------------------
@@ -30,6 +31,16 @@
  *     // The site intentionally exposes its users publicly (e.g. a
  *     // multi-author blog with public author pages/bylines):
  *     define( 'RDH_DISABLE_USERNAME_PROTECTION', true );
+ *
+ * UPDATES
+ * -------------------------------------------------------------------------
+ * This plugin updates itself from the GitHub Releases of the repository
+ * named in the Update URI header above, through the normal Plugins and
+ * Dashboard > Updates screens (see the "Self-updates" section at the end
+ * of this file). If the repository is private, define a read-only token in
+ * wp-config.php:
+ *
+ *     define( 'RDH_GITHUB_TOKEN', 'github_pat_...' );
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -530,3 +541,213 @@ if ( ! defined( 'RDH_DISABLE_USERNAME_PROTECTION' ) || ! RDH_DISABLE_USERNAME_PR
 		}
 	);
 }
+
+/**
+ * =============================================================================
+ * Self-updates from GitHub Releases.
+ * =============================================================================
+ *
+ * Lets WordPress detect and install new versions of this plugin from the
+ * dashboard, the same way it does for plugins hosted on wordpress.org, with
+ * no external library. It relies on three core hooks:
+ *
+ *   a) update_plugins_github.com (WordPress 5.8+). Core calls this filter
+ *      during its normal update check for any plugin whose "Update URI"
+ *      header points at github.com. The callback asks the GitHub API for
+ *      the repository's latest published release and reports its tag
+ *      (with any leading "v" removed) as the available version. Core then
+ *      compares that against the installed Version header and shows the
+ *      usual "update available" notice, the "Update now" link, and the
+ *      "Enable auto-updates" toggle. The Update URI header also stops
+ *      wordpress.org from ever offering an unrelated plugin that happens to
+ *      share this slug.
+ *   b) plugins_api. Supplies the "View version x.y.z details" popup with the
+ *      release notes from GitHub, instead of a wordpress.org lookup that
+ *      would fail.
+ *   c) upgrader_source_selection. GitHub's release zip extracts to a folder
+ *      named after the repository and tag (for example
+ *      johnbadapt23-request_download_hardening-1a2b3c4/), not to this
+ *      plugin's installed folder name (request-download-hardening/). This
+ *      renames the extracted folder to match the installed one before core
+ *      moves it into place, so the plugin stays active after updating and
+ *      is not duplicated. Whatever folder name the plugin is installed
+ *      under is the one that is kept.
+ *
+ * The GitHub response is cached for six hours (one hour after an error) so
+ * the API is not called on every admin page load, which also keeps well
+ * inside GitHub's unauthenticated rate limit. "Check again" on Dashboard >
+ * Updates clears that cache and checks immediately.
+ *
+ * Private repositories: define RDH_GITHUB_TOKEN in wp-config.php (a
+ * fine-grained personal access token with read-only "Contents" access to
+ * this one repository). The token is sent only to api.github.com, only for
+ * this repository's URLs. Public repositories need no token.
+ */
+
+if ( ! defined( 'RDH_GITHUB_REPO' ) ) {
+	define( 'RDH_GITHUB_REPO', 'johnbadapt23/request_download_hardening' );
+}
+
+/**
+ * Returns the latest GitHub release for RDH_GITHUB_REPO, or null if it could
+ * not be fetched. Cached in a site transient.
+ *
+ * @return array|null Keys: version, tag, package, url, notes, published.
+ */
+function rdh_github_latest_release() {
+	$cache_key = 'rdh_github_release';
+
+	if ( is_admin() && isset( $_GET['force-check'] ) && current_user_can( 'update_plugins' ) ) {
+		delete_site_transient( $cache_key );
+	}
+
+	$cached = get_site_transient( $cache_key );
+	if ( is_array( $cached ) ) {
+		return empty( $cached['version'] ) ? null : $cached;
+	}
+
+	$response = wp_remote_get(
+		'https://api.github.com/repos/' . RDH_GITHUB_REPO . '/releases/latest',
+		[
+			'timeout' => 10,
+			'headers' => [ 'Accept' => 'application/vnd.github+json' ],
+		]
+	);
+
+	$release = null;
+	if ( ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response ) ) {
+		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( is_array( $body ) && ! empty( $body['tag_name'] ) && ! empty( $body['zipball_url'] ) ) {
+			$release = [
+				'version'   => ltrim( (string) $body['tag_name'], 'vV' ),
+				'tag'       => (string) $body['tag_name'],
+				'package'   => (string) $body['zipball_url'],
+				'url'       => (string) ( $body['html_url'] ?? 'https://github.com/' . RDH_GITHUB_REPO ),
+				'notes'     => (string) ( $body['body'] ?? '' ),
+				'published' => (string) ( $body['published_at'] ?? '' ),
+			];
+		}
+	}
+
+	// An empty array is cached on failure so a GitHub outage, a missing
+	// release, or a missing token is retried hourly, not on every request.
+	set_site_transient( $cache_key, $release ?: [], $release ? 6 * HOUR_IN_SECONDS : HOUR_IN_SECONDS );
+
+	return $release;
+}
+
+add_filter(
+	'update_plugins_github.com',
+	function ( $update, $plugin_data, $plugin_file ) {
+		if ( plugin_basename( __FILE__ ) !== $plugin_file ) {
+			return $update; // Another plugin that also updates from GitHub.
+		}
+
+		$release = rdh_github_latest_release();
+		if ( ! $release ) {
+			return $update;
+		}
+
+		// Returned even when the version is not newer: core files it under
+		// "no update" in that case, which is what makes the auto-updates
+		// toggle appear on the Plugins screen.
+		return [
+			'id'      => $plugin_data['UpdateURI'],
+			'slug'    => dirname( $plugin_file ),
+			'version' => $release['version'],
+			'url'     => $release['url'],
+			'package' => $release['package'],
+		];
+	},
+	10,
+	3
+);
+
+add_filter(
+	'plugins_api',
+	function ( $result, $action, $args ) {
+		if ( 'plugin_information' !== $action || empty( $args->slug ) || dirname( plugin_basename( __FILE__ ) ) !== $args->slug ) {
+			return $result;
+		}
+
+		$release = rdh_github_latest_release();
+		if ( ! $release ) {
+			return $result;
+		}
+
+		$plugin = get_file_data( __FILE__, [ 'Name' => 'Plugin Name', 'Author' => 'Author', 'Description' => 'Description' ] );
+
+		return (object) [
+			'name'          => $plugin['Name'],
+			'slug'          => $args->slug,
+			'version'       => $release['version'],
+			'author'        => $plugin['Author'],
+			'homepage'      => 'https://github.com/' . RDH_GITHUB_REPO,
+			'download_link' => $release['package'],
+			'last_updated'  => $release['published'],
+			'sections'      => [
+				'description' => esc_html( $plugin['Description'] ),
+				'changelog'   => '' !== $release['notes'] ? nl2br( esc_html( $release['notes'] ) ) : esc_html__( 'No release notes provided.' ),
+			],
+		];
+	},
+	20,
+	3
+);
+
+add_filter(
+	'upgrader_source_selection',
+	function ( $source, $remote_source, $upgrader, $hook_extra = [] ) {
+		global $wp_filesystem;
+
+		if ( ! is_array( $hook_extra ) || ( $hook_extra['plugin'] ?? '' ) !== plugin_basename( __FILE__ ) ) {
+			return $source;
+		}
+
+		$folder = dirname( plugin_basename( __FILE__ ) );
+		if ( '.' === $folder ) {
+			return $source; // Installed as a loose file in wp-content/plugins; nothing to rename.
+		}
+
+		$desired = trailingslashit( $remote_source ) . $folder . '/';
+		if ( untrailingslashit( $source ) === untrailingslashit( $desired ) ) {
+			return $source;
+		}
+
+		if ( ! $wp_filesystem || ! $wp_filesystem->move( untrailingslashit( $source ), untrailingslashit( $desired ), true ) ) {
+			return new WP_Error( 'rdh_rename_failed', __( 'Could not rename the downloaded update folder to match the installed plugin.' ) );
+		}
+
+		return $desired;
+	},
+	10,
+	4
+);
+
+// Private repositories: authenticate this plugin's own GitHub API requests
+// (the release lookup and the zip download) and nothing else.
+add_filter(
+	'http_request_args',
+	function ( $args, $url ) {
+		if ( defined( 'RDH_GITHUB_TOKEN' ) && RDH_GITHUB_TOKEN && 0 === strpos( $url, 'https://api.github.com/repos/' . RDH_GITHUB_REPO . '/' ) ) {
+			$args['headers']                  = (array) ( $args['headers'] ?? [] );
+			$args['headers']['Authorization'] = 'Bearer ' . RDH_GITHUB_TOKEN;
+		}
+		return $args;
+	},
+	10,
+	2
+);
+
+// Drop the cached release once this plugin has been updated, so the next
+// check reflects the new installed version straight away.
+add_action(
+	'upgrader_process_complete',
+	function ( $upgrader, $hook_extra ) {
+		if ( ( $hook_extra['type'] ?? '' ) === 'plugin' && in_array( plugin_basename( __FILE__ ), (array) ( $hook_extra['plugins'] ?? [ $hook_extra['plugin'] ?? '' ] ), true ) ) {
+			delete_site_transient( 'rdh_github_release' );
+		}
+	},
+	10,
+	2
+);
