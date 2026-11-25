@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Request & Download Hardening
- * Description: Four narrow, self-contained security fixes that work on any WordPress site with no configuration: (1) closes unauthenticated access to Download Monitor (dlm_download) files via both the REST API and the direct /download/ link, (2) strips HTML/script markup out of incoming GET parameters before any theme or plugin code can read them, closing reflected-XSS holes in custom search/filter templates, (3) hardens XML-RPC by removing the pingback methods used for SSRF/DDoS amplification, hiding the endpoint's discovery header/link, and rate-limiting failed login attempts (covers both wp-login.php and XML-RPC, since both share WordPress's own authentication pipeline), and (4) blocks the two standard ways a site leaks its real usernames to a logged-out visitor (?author=N probing and the public REST users list) and genericizes the login form's error message so it stops confirming whether a guessed username exists. Every module no-ops safely if its target isn't present, and none of them touch POST, AJAX, cron, wp-admin, or any already-authenticated visitor - normal site functionality, layout, and content editing are completely unaffected.
- * Version: 1.3.2
+ * Description: Lightweight security hardening with no configuration: restricts Download Monitor files to logged-in users, strips markup from GET parameters, hardens XML-RPC and rate-limits failed logins, and prevents username enumeration. Updates from GitHub.
+ * Version: 1.3.3
  * Author: ADAPT
  * License: GPL-2.0-or-later
  * Update URI: https://github.com/johnbadapt23/request_download_hardening
