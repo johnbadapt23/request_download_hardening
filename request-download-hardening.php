@@ -1,19 +1,19 @@
 <?php
 /**
  * Plugin Name: Request & Download Hardening
- * Description: Lightweight security hardening with no configuration: restricts Download Monitor files to logged-in users, strips markup from GET parameters, hardens XML-RPC and rate-limits failed logins, and prevents username enumeration, restricts credentialed cross-origin REST API access, and hides the media library from logged-out REST requests. Updates from GitHub.
- * Version: 1.4.0
+ * Description: Lightweight security hardening with no configuration: restricts Download Monitor files to logged-in users, strips markup from GET parameters, hardens XML-RPC and rate-limits failed logins, and prevents username enumeration, restricts credentialed cross-origin REST API access, hides the media library from logged-out REST requests, and sends baseline browser security headers. Updates from GitHub.
+ * Version: 1.5.0
  * Author: ADAPT
  * License: GPL-2.0-or-later
  * Update URI: https://github.com/johnbadapt23/request_download_hardening
  *
  * HOW TO DISABLE A MODULE ON A SITE WHERE ITS DEFAULT WOULD BE WRONG
  * -------------------------------------------------------------------------
- * All six modules default to ON, because an unauthenticated download/API
+ * All seven modules default to ON, because an unauthenticated download/API
  * leak, an unescaped request parameter, an open pingback relay, a leaked
- * admin username, a REST API that trusts every website's cookies, and a
- * publicly listed media library are virtually never something a site
- * actually wants. If a specific site genuinely needs one module off, define the
+ * admin username, a REST API that trusts every website's cookies, a
+ * publicly listed media library, and pages any website can frame are
+ * virtually never something a site actually wants. If a specific site genuinely needs one module off, define the
  * matching constant in that site's wp-config.php (above the "That's all,
  * stop editing!" line) BEFORE activating:
  *
@@ -41,6 +41,10 @@
  *     // A front-end script on the site reads the media library through the
  *     // REST API without logging in (see Module 6 below):
  *     define( 'RDH_DISABLE_MEDIA_REST_LOCKDOWN', true );
+ *
+ *     // The site must be framed by another domain, or the web server
+ *     // already sends these headers itself (see Module 7 below):
+ *     define( 'RDH_DISABLE_SECURITY_HEADERS', true );
  *
  * UPDATES
  * -------------------------------------------------------------------------
@@ -724,6 +728,86 @@ if ( ! defined( 'RDH_DISABLE_MEDIA_REST_LOCKDOWN' ) || ! RDH_DISABLE_MEDIA_REST_
 			return $endpoints;
 		}
 	);
+}
+
+/**
+ * =============================================================================
+ * MODULE 7: Baseline browser security headers (clickjacking, MIME sniffing).
+ * =============================================================================
+ *
+ * What this fixes: on 2026-11-26 adapt.com.au and staging.adapt.com.au sent
+ * neither X-Frame-Options nor X-Content-Type-Options on their pages, so any
+ * other website could load them inside a frame (the basis of clickjacking,
+ * where a visitor is tricked into clicking something on a page they cannot
+ * see), and browsers were free to second-guess the declared type of a
+ * response. The two portal sites already sent both headers on their
+ * front-end pages, but wp-login.php on the portal sent no
+ * X-Content-Type-Options.
+ *
+ * The fix sends two long-standing, universally supported headers:
+ *
+ *   X-Frame-Options: SAMEORIGIN    - only this site may frame its pages.
+ *   X-Content-Type-Options: nosniff - browsers must honour Content-Type.
+ *
+ * They are sent on send_headers (every front-end page WordPress renders)
+ * and on login_init (wp-login.php, which never fires send_headers). Before
+ * sending each one, headers_list() is checked and any header that is
+ * already set - by WordPress core (which sends X-Frame-Options itself on
+ * wp-login.php and in wp-admin), the theme, or another plugin - is left
+ * exactly as it is, so a site never gets duplicate or conflicting values.
+ * send_headers runs at priority 999 so that check happens after other
+ * callbacks have had their turn.
+ *
+ * Scope and limits: this only covers responses WordPress itself generates.
+ * Static files served directly by the web server (images, CSS, JS) and
+ * REST API responses do not pass through these hooks. Headers added by
+ * the web server itself (for example nginx add_header) are invisible to
+ * headers_list(); if a site ever adds these two at server level as well,
+ * define the toggle below on that site. SAMEORIGIN still allows the site
+ * to frame its own pages, so the block editor's previews and any
+ * same-site iframes keep working. A site that genuinely needs to be
+ * framed by another domain should disable this module.
+ */
+
+if ( ! defined( 'RDH_DISABLE_SECURITY_HEADERS' ) || ! RDH_DISABLE_SECURITY_HEADERS ) {
+
+	// --- 7a. Front-end pages. ---
+	add_action( 'send_headers', 'rdh_send_security_headers', 999 );
+
+	// --- 7b. wp-login.php (does not fire send_headers). ---
+	add_action( 'login_init', 'rdh_send_security_headers', 999 );
+}
+
+/**
+ * Sends X-Frame-Options and X-Content-Type-Options unless a header of the
+ * same name has already been set for this response. Used only by Module 7
+ * above.
+ *
+ * @return void
+ */
+function rdh_send_security_headers() {
+	if ( headers_sent() ) {
+		return;
+	}
+
+	$already_set = array();
+	foreach ( headers_list() as $line ) {
+		$name = strtolower( trim( (string) strtok( $line, ':' ) ) );
+		if ( '' !== $name ) {
+			$already_set[ $name ] = true;
+		}
+	}
+
+	$wanted = array(
+		'X-Frame-Options'        => 'SAMEORIGIN',
+		'X-Content-Type-Options' => 'nosniff',
+	);
+
+	foreach ( $wanted as $name => $value ) {
+		if ( empty( $already_set[ strtolower( $name ) ] ) ) {
+			header( $name . ': ' . $value );
+		}
+	}
 }
 
 /**
