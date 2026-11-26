@@ -1,18 +1,19 @@
 <?php
 /**
  * Plugin Name: Request & Download Hardening
- * Description: Lightweight security hardening with no configuration: restricts Download Monitor files to logged-in users, strips markup from GET parameters, hardens XML-RPC and rate-limits failed logins, and prevents username enumeration. Updates from GitHub.
- * Version: 1.3.3
+ * Description: Lightweight security hardening with no configuration: restricts Download Monitor files to logged-in users, strips markup from GET parameters, hardens XML-RPC and rate-limits failed logins, and prevents username enumeration, restricts credentialed cross-origin REST API access, and hides the media library from logged-out REST requests. Updates from GitHub.
+ * Version: 1.4.0
  * Author: ADAPT
  * License: GPL-2.0-or-later
  * Update URI: https://github.com/johnbadapt23/request_download_hardening
  *
  * HOW TO DISABLE A MODULE ON A SITE WHERE ITS DEFAULT WOULD BE WRONG
  * -------------------------------------------------------------------------
- * All four modules default to ON, because an unauthenticated download/API
- * leak, an unescaped request parameter, an open pingback relay, and a
- * leaked admin username are virtually never something a site actually
- * wants. If a specific site genuinely needs one module off, define the
+ * All six modules default to ON, because an unauthenticated download/API
+ * leak, an unescaped request parameter, an open pingback relay, a leaked
+ * admin username, a REST API that trusts every website's cookies, and a
+ * publicly listed media library are virtually never something a site
+ * actually wants. If a specific site genuinely needs one module off, define the
  * matching constant in that site's wp-config.php (above the "That's all,
  * stop editing!" line) BEFORE activating:
  *
@@ -31,6 +32,15 @@
  *     // The site intentionally exposes its users publicly (e.g. a
  *     // multi-author blog with public author pages/bylines):
  *     define( 'RDH_DISABLE_USERNAME_PROTECTION', true );
+ *
+ *     // The site deliberately lets any website make credentialed REST API
+ *     // requests (to allow just one extra origin instead, use
+ *     // RDH_CORS_ALLOWED_ORIGINS - see Module 5 below):
+ *     define( 'RDH_DISABLE_CORS_LOCKDOWN', true );
+ *
+ *     // A front-end script on the site reads the media library through the
+ *     // REST API without logging in (see Module 6 below):
+ *     define( 'RDH_DISABLE_MEDIA_REST_LOCKDOWN', true );
  *
  * UPDATES
  * -------------------------------------------------------------------------
@@ -538,6 +548,180 @@ if ( ! defined( 'RDH_DISABLE_USERNAME_PROTECTION' ) || ! RDH_DISABLE_USERNAME_PR
 		'login_errors',
 		function () {
 			return __( '<strong>Error:</strong> Invalid username or password.' );
+		}
+	);
+}
+
+/**
+ * =============================================================================
+ * MODULE 5: Restrict credentialed cross-origin REST API access (CORS).
+ * =============================================================================
+ *
+ * What this fixes: every /wp-json/ response echoes back whatever Origin
+ * header the request sent, in Access-Control-Allow-Origin, together with
+ * Access-Control-Allow-Credentials: true. Browsers read that as "any
+ * website may make cookie-carrying requests to this API and read the
+ * response". This was confirmed on all four ADAPT sites on 2026-11-26: a
+ * credentialed fetch() from an unrelated origin (https://example.com) read
+ * the /wp-json/wp/v2/posts response successfully on every one of them.
+ *
+ * Root cause: this is stock WordPress behaviour, not a theme snippet or a
+ * plugin setting. Core's rest_send_cors_headers() (hooked on
+ * rest_pre_serve_request, identical in WordPress 6.7 and trunk) echoes any
+ * non-empty Origin and always adds Allow-Credentials: true. It does NOT
+ * consult is_allowed_http_origin() or the allowed_http_origins filter, so
+ * hooking that filter - however late, and whatever it returns - has no
+ * effect on REST API responses. That is why this module replaces core's
+ * header callback instead.
+ *
+ * How much this exposed in practice: core's rest_cookie_check_errors()
+ * treats any cookie-authenticated REST request that carries no valid
+ * wp_rest nonce as logged out, and a foreign site cannot obtain that
+ * nonce. So the reflected header alone does not let another site act as,
+ * or read the private data of, a logged-in visitor through core's own
+ * cookie authentication. It is still a needless trust grant: it removes a
+ * layer of defence, and any plugin that authenticates REST requests some
+ * other way (or skips the nonce check) would inherit the exposure.
+ *
+ * The fix: on rest_api_init at priority 999 (after core's own
+ * rest_api_default_filters() has registered rest_send_cors_headers at
+ * priority 10), remove core's callback and register
+ * rdh_send_restricted_cors_headers() in its place. It sends the same three
+ * headers core would, but only when the request's Origin exactly matches
+ * an allowlisted origin. Every other origin gets no Access-Control-Allow-*
+ * headers at all, so the browser blocks the cross-origin read exactly as
+ * it would for any ordinary page. Vary: Origin is always sent so a cache
+ * never serves one origin's CORS headers to another. Same-origin requests
+ * (the block editor, wp-admin, the site's own front-end scripts) are
+ * unaffected, because browsers do not apply CORS to them at all.
+ *
+ * The allowlist is the site's own home_url() and site_url() origins, plus
+ * any origins a site defines in wp-config.php, for example a widget that
+ * genuinely needs credentialed cross-origin access to this site's API:
+ *
+ *     define( 'RDH_CORS_ALLOWED_ORIGINS', array( 'https://widget.example' ) );
+ *
+ * Entries are compared as scheme://host[:port], lower-cased, with any path
+ * or trailing slash ignored. No third-party origin is hard-coded here.
+ */
+
+if ( ! defined( 'RDH_DISABLE_CORS_LOCKDOWN' ) || ! RDH_DISABLE_CORS_LOCKDOWN ) {
+
+	// --- 5a. Swap core's reflect-any-origin callback for the allowlisted one. ---
+	add_action(
+		'rest_api_init',
+		function () {
+			remove_filter( 'rest_pre_serve_request', 'rest_send_cors_headers' );
+			add_filter( 'rest_pre_serve_request', 'rdh_send_restricted_cors_headers' );
+		},
+		999 // After core's rest_api_default_filters() (priority 10) has added rest_send_cors_headers - see the doc comment above.
+	);
+}
+
+/**
+ * Normalises a URL to its origin (scheme://host[:port], lower-cased), or
+ * returns '' if it has no scheme or host. Used only by Module 5 above.
+ *
+ * @param string $url Any absolute URL or bare origin.
+ * @return string
+ */
+function rdh_url_to_origin( $url ) {
+	$parts = wp_parse_url( trim( (string) $url ) );
+	if ( empty( $parts['scheme'] ) || empty( $parts['host'] ) ) {
+		return '';
+	}
+	$origin = strtolower( $parts['scheme'] . '://' . $parts['host'] );
+	if ( ! empty( $parts['port'] ) ) {
+		$origin .= ':' . (int) $parts['port'];
+	}
+	return $origin;
+}
+
+/**
+ * Returns the origins allowed credentialed cross-origin REST access: this
+ * site's own home_url() and site_url() origins, plus RDH_CORS_ALLOWED_ORIGINS
+ * (an array or a comma-separated string) if wp-config.php defines it. Used
+ * only by Module 5 above.
+ *
+ * @return string[]
+ */
+function rdh_cors_allowed_origins() {
+	$origins = array( home_url(), site_url() );
+
+	if ( defined( 'RDH_CORS_ALLOWED_ORIGINS' ) ) {
+		$extra   = is_array( RDH_CORS_ALLOWED_ORIGINS ) ? RDH_CORS_ALLOWED_ORIGINS : explode( ',', (string) RDH_CORS_ALLOWED_ORIGINS );
+		$origins = array_merge( $origins, $extra );
+	}
+
+	return array_values( array_unique( array_filter( array_map( 'rdh_url_to_origin', $origins ) ) ) );
+}
+
+/**
+ * Replacement for core's rest_send_cors_headers(): sends the same headers,
+ * but only for an allowlisted Origin. Used only by Module 5 above.
+ *
+ * @param bool $value Whether the request has already been served (passed through untouched).
+ * @return bool
+ */
+function rdh_send_restricted_cors_headers( $value ) {
+	if ( headers_sent() ) {
+		return $value;
+	}
+
+	header( 'Vary: Origin', false );
+
+	$origin = get_http_origin();
+	if ( $origin && in_array( rdh_url_to_origin( $origin ), rdh_cors_allowed_origins(), true ) ) {
+		header( 'Access-Control-Allow-Origin: ' . sanitize_url( $origin ) );
+		header( 'Access-Control-Allow-Methods: OPTIONS, GET, POST, PUT, PATCH, DELETE' );
+		header( 'Access-Control-Allow-Credentials: true' );
+	}
+
+	return $value;
+}
+
+/**
+ * =============================================================================
+ * MODULE 6: Hide the media library from logged-out REST API requests.
+ * =============================================================================
+ *
+ * What this fixes: WordPress's core REST API publishes the whole media
+ * library to anyone at /wp-json/wp/v2/media and /wp-json/wp/v2/media/{id} -
+ * every attachment's title, slug, file name, upload path and source URL,
+ * paginated, no login required. On research.adapt.com.au that listing
+ * returned about 19,100 items on 2026-11-26, including the file names and
+ * paths of documents under protected-reports. The files themselves were
+ * still refused (403/404), but the listing alone discloses what exists,
+ * what it is called and where it lives - which is exactly what someone
+ * would need to look for weaker routes to those files.
+ *
+ * The fix: both routes are removed via the rest_endpoints filter for any
+ * request that isn't logged in - the same technique Module 4b uses for the
+ * user-listing routes. A logged-in request (the block editor and the media
+ * library screens in wp-admin, which always send the REST nonce) still
+ * sees the routes exactly as before. Images and files embedded in pages
+ * are unaffected: WordPress renders those server-side, not through the
+ * REST API. Before this module was added, the logged-out pages and every
+ * same-origin script on research.adapt.com.au and adapt.com.au were
+ * checked for front-end use of the media endpoint, and none was found.
+ *
+ * One consequence to be aware of: a front-end script that reads the media
+ * endpoint without sending the REST nonce counts as logged out (core's
+ * rest_cookie_check_errors() treats it that way), so it would lose access
+ * too. If a site turns out to depend on that, disable this module there.
+ */
+
+if ( ! defined( 'RDH_DISABLE_MEDIA_REST_LOCKDOWN' ) || ! RDH_DISABLE_MEDIA_REST_LOCKDOWN ) {
+
+	// --- 6a. Remove the public REST API media-listing routes. ---
+	add_filter(
+		'rest_endpoints',
+		function ( $endpoints ) {
+			if ( ! is_user_logged_in() ) {
+				unset( $endpoints['/wp/v2/media'] );
+				unset( $endpoints['/wp/v2/media/(?P<id>[\d]+)'] );
+			}
+			return $endpoints;
 		}
 	);
 }
